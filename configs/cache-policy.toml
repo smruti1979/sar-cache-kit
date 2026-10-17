@@ -1,0 +1,166 @@
+# SAR cache policy: single source of truth for TTLs, staleness limits and
+# invalidation rules. Read by tools/linksim.py; mirror these values in your
+# service configs. All numbers are reference values: tune with field data.
+
+[meta]
+schema = 1
+name = "sar-cache-policy"
+version = "1.0.0"
+
+[defaults]
+ttl_jitter = 0.10                      # +/-10% per key to avoid synchronized expiry
+envelope = ["source", "as_of", "ttl", "version", "confidence", "scope", "classification"]
+
+# ---- Freshness classes ------------------------------------------------------
+# ttl_s       fresh window. After it the entry is "expired".
+# warn_s      UI shows an age warning beyond this age.
+# stale_s     UI marks the item STALE beyond this age.
+# max_stale_s hard limit: older entries are never served (item shown unavailable).
+# serve_stale "flagged" = serve with age/STALE label; "never" = miss instead.
+
+[classes.A]
+label = "life-critical dynamic"
+ttl_s = 10
+warn_s = 10
+stale_s = 60
+max_stale_s = 86400                    # never silently dropped: shown as STALE with age
+serve_stale = "flagged"
+swr = false
+invalidation = "push"
+
+[classes.B]
+label = "semi-dynamic"
+ttl_s = 900
+warn_s = 900
+stale_s = 10800
+max_stale_s = 10800
+serve_stale = "flagged"
+swr = true
+prefetch_frac = 0.8                    # refresh hot keys at 80% of TTL while link is up
+invalidation = "version"
+
+[classes.C]
+label = "static or slow"
+ttl_s = 604800
+warn_s = 604800
+stale_s = 7776000
+max_stale_s = 7776000
+serve_stale = "flagged"
+swr = true
+prefetch_frac = 0.9
+invalidation = "bundle_version"
+
+[classes.D]
+label = "derived and expensive"
+ttl_s = 3600
+warn_s = 3600
+stale_s = 3600
+max_stale_s = 3600
+serve_stale = "never"
+swr = false
+invalidation = "key_version"           # input hash + model/tool version in the key
+
+# ---- Data items -------------------------------------------------------------
+
+[data.asset_position]
+class = "A"
+key = "asset:{id}"
+stores = ["state_redis", "mqtt_retained", "device_last_value"]
+evictable = false
+
+[data.detection_candidate]
+class = "A"
+key = "det:{id}"
+stores = ["state_redis", "event_log"]
+ttl_s = 0                              # no expiry during the incident
+evictable = false
+never_auto_clear = true                # only a human confirm/reject changes it
+
+[data.sector_assignment]
+class = "A"
+key = "sector:{id}"
+stores = ["state_redis"]
+authoritative = true
+evictable = false
+
+[data.hazard_feed]
+class = "A"
+key = "hazard:{feed}:{cell}"
+stores = ["cache_redis", "regional_pull_through"]
+ttl_s = 300
+max_stale_s = 1800
+push_on_alert = true
+
+[data.weather_forecast]
+class = "B"
+key = "wx:{cell}:{model_run}"
+stores = ["cache_redis", "regional_pull_through"]
+ttl_s = 900
+max_stale_s = 10800
+
+[data.probability_map]
+class = "B"
+key = "pmap:{incident}:{version}"
+stores = ["tile_cache", "raster"]
+versioned = true
+
+[data.coverage_map]
+class = "A"
+key = "cov:{incident}:{version}"
+stores = ["state_redis_bitmaps", "postgis_matview"]
+derived_from = "sensor_logs"
+never_infer_from_cache = true
+
+[data.base_tiles]
+class = "C"
+key = "tiles:{bundle}/{z}/{x}/{y}"
+stores = ["pmtiles_bundle", "device", "icp"]
+
+[data.satellite_imagery]
+class = "C"
+key = "img:{capture_date}/{z}/{x}/{y}"
+stores = ["cog", "tile_cache"]
+show_capture_date = true
+
+[data.terrain_derivatives]
+class = "C"
+key = "cost:{season}:{wx_class}:{version}"
+stores = ["raster_files", "os_page_cache"]
+
+[data.protocol_docs]
+class = "C"
+key = "doc:{id}:{version}"
+stores = ["rag_index", "prefix_cache"]
+purge_dependents_on_new_version = ["semantic_cache", "prefix_cache"]
+
+[data.embedding]
+class = "D"
+key = "emb:{model_version}:{content_sha256}"
+ttl_s = 2592000
+
+[data.detection_result]
+class = "D"
+key = "detres:{frame_hash}:{model_version}:{threshold}"
+ttl_s = 600
+
+[data.tool_result_readonly]
+class = "D"
+key = "tool:{tool}:{tool_version}:{args_hash}:{scope}"
+ttl_s = 300
+
+[data.auth_decision]
+class = "D"
+key = "authz:{subject}:{action}:{resource}"
+ttl_s = 45
+default = "deny"
+revocation = "push"
+
+# ---- Never cache --------------------------------------------------------------
+[never_cache]
+items = [
+  "actuator_command",          # drone / robot commands
+  "approval",                  # human approvals
+  "dispatch_order",
+  "dosing_calculation",        # compute fresh from verified inputs
+  "no_detection_result",       # a cached "nothing found" must never read as "clear"
+]
